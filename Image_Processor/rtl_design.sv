@@ -1,113 +1,87 @@
 // RTL Design Task: Image Processor with 3x3 Kernel Filters
-module image_processor (
-  input logic clk,
-  input logic rst_n,
-  input logic [1:0] config_select,
-  
-// DXI handshake
-  input logic [7:0] input_data [0:2][0:2],
-  input logic input_valid,
-  output logic input_ready,
-    
-  output logic [15:0] output_data,
-  output logic output_valid,
-  input  logic output_ready
+module image_processor #(
+    parameter DATA_WIDTH = 8
+)(
+    input  logic clk,
+    input  logic rst_n,
+    input  logic [1:0] config_select, // configuration
+    // DXI input
+    input  logic [DATA_WIDTH*9-1:0] in_data,  // 3x3 window
+    input  logic in_valid,
+    output logic in_ready,
+    // DXI  output
+    output logic [DATA_WIDTH-1:0] out_data,
+    output logic out_valid,
+    input  logic out_ready
 );
- 
-  logic signed [7:0]  filter [0:2][0:2];
-  logic signed [15:0] acc; // to avoid overflow during multiplying
-  logic processing;
-  logic [3:0] divisor; // coefficient for normalization stage
 
-// filter selection
-   always_comb begin
-       case (config_select)
-           2'b00: begin // Laplacian Kernel 1 - edge cases
-               filter = '{
-                   '{0,  -1,  0},
-                   '{-1,  4, -1},
-                   '{0,  -1,  0}
-               };
-               divisor = 1;
-           end
-            
-           2'b01: begin // Laplacian Kernel 2 - edge cases
-               filter = '{
-                   '{-1, -1, -1},
-                   '{-1,  8, -1},
-                   '{-1, -1, -1}
-               };
-               divisor = 1;
-           end
-            
-           2'b10: begin // Gaussian Filter (3x3) - blurring/smoothing
-               filter = '{
-                   '{1, 2, 1},
-                   '{2, 4, 2},
-                   '{1, 2, 1}
-               };
-               divisor = 16;
-           end
-            
-           2'b11: begin // Average Filter (3x3) - noise reduction
-               filter = '{
-                   '{1, 1, 1},
-                   '{1, 1, 1},
-                   '{1, 1, 1}
-               };
-               divisor = 9;
-           end
-       endcase
-   end
+    // Signals for kernel coefficients
+    logic signed [3:0] kernel [0:3][0:8];  // 4 filters
+    logic signed [DATA_WIDTH-1:0] window [0:8];
+  logic signed [DATA_WIDTH+4:0] result;  // extra bits for multiplication and addition
+    
+    // Filters
+    always_comb begin
+      kernel[0] = '{0, -1, 0, -1, 4, -1, 0, -1, 0};     // Laplacian Kernel 1  (2'b00)
+      kernel[1] = '{-1, -1, -1, -1, 8, -1, -1, -1, -1}; // Laplacian Kernel 2  (2'b01)
+      kernel[2] = '{1, 2, 1, 2, 4, 2, 1, 2, 1};         // Gaussian Filter     (2'b10)
+      kernel[3] = '{1, 1, 1, 1, 1, 1, 1, 1, 1};         // Average Filter      (2'b11)
+    end
 
-// stages sequence management
-   enum logic [1:0] {
-       IDLE,    // waiting for new data
-       COMPUTE, // calculating
-       OUTPUT   // result
-   } state, next_state;
+    // Unpack input data into window array
+    always_comb begin
+        for (int i = 0; i < 9; i++) begin
+            window[i] = in_data[DATA_WIDTH*i +: DATA_WIDTH];
+        end
+    end
 
-   always_ff @(posedge clk or negedge rst_n) begin
-       if (!rst_n)
-           state <= IDLE;
-       else
-           state <= next_state;
-   end
-
-   always_comb begin
-       next_state = state;
-       case (state)
-           IDLE: 
-               if (input_valid)
-                   next_state = COMPUTE;
-            
-           COMPUTE:
-               next_state = OUTPUT;
-            
-           OUTPUT:
-               if (output_ready)
-                   next_state = IDLE;
-       endcase
-   end
-
-// calculation
-   always_ff @(posedge clk) begin
-       if (state == COMPUTE) begin
-           acc <= '0;
-           for (int i = 0; i < 3; i++) begin
-               for (int j = 0; j < 3; j++) begin
-                   acc <= acc + (input_data[i][j] * filter[i][j]);
-               end
-           end
-       end
-   end
-
-// states synchronization
-   always_comb begin
-       input_ready = (state == IDLE);
-       output_valid = (state == OUTPUT);
+    // Convolution process with normalization
+    always_comb begin
+        result = '0;
+        for (int i = 0; i < 9; i++) begin  
+            result += window[i] * kernel[config_select][i];
+            $display("Intermediate result (before normalization) = %0d", result);
+        end
         
-       output_data = acc / divisor; // normalization to avoid overflow
-   end
+        // Normalize based on filter type with rounding
+        case (config_select)
+          2'b00, 2'b01: begin  // Laplacian filters (no divide)
+        // add proper bit truncation and sign extension
+        out_data = result[DATA_WIDTH+4:0] > $signed({DATA_WIDTH{1'b0}}) ? 
+                   $signed({DATA_WIDTH{1'b0}}) :
+                   result[DATA_WIDTH+4:0] < -$signed({DATA_WIDTH{1'b0}}) ? 
+                   -$signed({DATA_WIDTH{1'b0}}) :
+                   result[DATA_WIDTH-1:0];
+            end
+            2'b10: begin         // Gaussian (divide by 16)
+                out_data = (result + 8) >>> 4;  // Add 8 for proper rounding
+            end
+            2'b11: begin         // Average (divide by 9)
+            /*
+            For division by 9, multiply by 7281 (65536/9 = 7281.777...)
+            and shift right by 16 bits for fixed-point division
+            */
+                logic signed [DATA_WIDTH+20:0] temp;
+                temp = (result * 7281 + 32768) >>> 16;  // Add 32768 for proper rounding
+                out_data = temp;
+            end
+        endcase
+    end
+
+    // Handshaking logic
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            out_valid <= 1'b0;
+            in_ready <= 1'b1;
+        end else begin
+            if (in_valid && in_ready) begin
+                out_valid <= 1'b1;
+            end else if (out_valid && out_ready) begin
+                out_valid <= 1'b0;
+            end
+
+            in_ready <= !out_valid || out_ready;
+        end
+    end
 
 endmodule
